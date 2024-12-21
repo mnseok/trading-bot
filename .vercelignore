@@ -1,0 +1,9 @@
+# .vercelignore
+*.log
+*.mp4
+*.jpg
+*.png
+venv/
+__pycache__/
+node_modules/
+tests/
