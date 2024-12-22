@@ -32,7 +32,35 @@ import sqlite3
 # 유튜브 자막 API
 from youtube_transcript_api import YouTubeTranscriptApi
 
+import os
+import time
+import json
+import logging
+from datetime import datetime, timedelta
+import sys
 
+# 기존 코드 상단에 추가: logging 설정
+def setup_logging(log_file="trading_bot.log"):
+    """Setup logging to log all outputs to a file."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s]: %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, mode="a"),  # Append mode
+        ]
+    )
+
+    # Redirect print to logging
+    class LoggingWrapper:
+        def write(self, message):
+            if message.strip():
+                logging.info(message.strip())
+        def flush(self):  # Dummy flush to avoid AttributeError
+            pass
+
+    sys.stdout = LoggingWrapper()  # Redirect print
+    sys.stderr = LoggingWrapper()  # Redirect errors (optional)
+    
 # pd.Timestamp -> isoformat 변환용
 def convert_timestamps(data):
     if isinstance(data, dict):
@@ -84,17 +112,18 @@ def take_fullpage_screenshot(url: str, screenshot_name: str = "full_screenshot.p
         time.sleep(1)
 
         driver.save_screenshot(screenshot_name)
-        print(f"차트 스크린샷 저장 완료: {os.path.abspath(screenshot_name)}")
+        print(f"[INFO] Full-page screenshot saved as {screenshot_name}")
 
     except Exception as e:
         print("에러가 발생했습니다:", e)
     finally:
         driver.quit()
-
-
+        
 class BitcoinTrader:
     def __init__(self):
         # .env 파일 불러오기
+        # setup_logging()
+        
         load_dotenv()
         self.access = os.getenv("UPBIT_ACCESS_KEY")
         self.secret = os.getenv("UPBIT_SECRET_KEY")
@@ -141,12 +170,13 @@ Your job: Provide a buy/sell/hold decision & rationale.
             "temperature": 1,
             "top_p": 0.9,
             "top_k": 40,
-            "max_output_tokens": 2048,
+            "max_output_tokens": 8192,
             "response_mime_type": "application/json",
         }
 
         self.model_trading = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            # model_name="gemini-1.5-flash",
+            model_name="gemini-2.0-flash-exp",
             system_instruction=trading_system_message,
             generation_config=trading_gen_config
         )
@@ -172,7 +202,7 @@ Your style: objective, concise, and offering improvements for the future.
         )
 
     def create_table(self):
-        """매매 기록 테이블 생성 (reflection 컬럼 추가)"""
+        """매매 기록 테이블 생성 (reflection, key_improvement_points, confidence_level 컬럼 추가)"""
         self.db_cursor.execute("""
         CREATE TABLE IF NOT EXISTS trade_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,7 +212,10 @@ Your style: objective, concise, and offering improvements for the future.
             trade_amount REAL NOT NULL,
             reason TEXT,
             balance_after REAL NOT NULL,
-            reflection TEXT
+            reflection TEXT,
+            key_improvement_points TEXT,
+            confidence_level REAL,
+            coin_ticker TEXT NOT NULL
         );
         """)
         self.db_connection.commit()
@@ -198,18 +231,42 @@ Your style: objective, concise, and offering improvements for the future.
             print(f"Error fetching YouTube transcript: {e}")
             return ""
 
-    def load_all_reflections(self, limit=5):
-        """가장 최근 N개 reflection을 가져와서 리스트로 반환"""
+    def load_all_reflections(self, limit=5, coin_ticker=None):
+        """가장 최근 N개 reflection, key_improvement_points, confidence_level을 가져와서 리스트로 반환"""
         try:
+            if coin_ticker is None:
+                coin_ticker = self.ticker
+
             self.db_cursor.execute("""
-                SELECT reflection FROM trade_records 
-                WHERE reflection IS NOT NULL AND reflection != ''
+                SELECT reflection, key_improvement_points, confidence_level
+                FROM trade_records
+                WHERE reflection IS NOT NULL AND reflection != '' AND coin_ticker = ?
                 ORDER BY timestamp DESC
                 LIMIT ?
-            """, (limit,))
+            """, (coin_ticker, limit))
             rows = self.db_cursor.fetchall()
-            reflections = [row[0] for row in rows if row[0]]
-            return reflections
+            
+            # rows는 [(reflection, kip, conf), (reflection, kip, conf), ...] 형태
+            # 이 데이터를 문자열 형태로 합칠지, dict 형태로 반환할지 결정
+            
+            # (A) 문자열 형태로 바로 구성
+            combined_list = []
+            for reflection, kip, conf in rows:
+                # 값이 None인 경우 빈 문자열로 처리
+                reflection_str = reflection if reflection else "N/A"
+                kip_str = kip if kip else "N/A"
+                conf_str = conf if conf else "N/A"
+
+                # 보기 좋게 합친다
+                segment = (
+                    f"Reflection: {reflection_str}\n"
+                    f"Key Improvement Points: {kip_str}\n"
+                    f"Confidence Level: {conf_str}"
+                )
+                combined_list.append(segment)
+
+            return combined_list
+
         except Exception as e:
             print(f"Error loading reflections: {e}")
             return []
@@ -218,20 +275,34 @@ Your style: objective, concise, and offering improvements for the future.
         """매매 기록을 데이터베이스에 저장"""
         timestamp = datetime.now().isoformat()
         self.db_cursor.execute("""
-        INSERT INTO trade_records (timestamp, action, trade_percent, trade_amount, reason, balance_after)
-        VALUES (?, ?, ?, ?, ?, ?);
-        """, (timestamp, action, trade_percent, trade_amount, reason, balance_after))
+        INSERT INTO trade_records (timestamp, action, trade_percent, trade_amount, reason, balance_after, coin_ticker)
+        VALUES (?, ?, ?, ?, ?, ?, ?);
+        """, (timestamp, action, trade_percent, trade_amount, reason, balance_after, self.ticker))
         self.db_connection.commit()
         print(f"[DB] 매매 기록 저장 완료: {action} {trade_amount} at {timestamp}")
 
-    def store_reflection_for_trade(self, trade_id, reflection_text):
-        """반성문(Reflection) DB 업데이트"""
+    def store_reflection_for_trade(self, trade_id, reflection_data):
+        """
+        반성문(Reflection), 개선점, 자신도(Confidence) DB 업데이트
+        reflection_data 예시:
+        {
+            "reflection": "내용...",
+            "key_improvement_points": "내용...",
+            "confidence_level": "0.8"
+        }
+        """
         try:
+            reflection_text = reflection_data.get("reflection", "")
+            key_improvement_points = reflection_data.get("key_improvement_points", "")
+            confidence_level = reflection_data.get("confidence_level", "")
+
             self.db_cursor.execute("""
                 UPDATE trade_records
-                SET reflection = ?
+                SET reflection = ?,
+                    key_improvement_points = ?,
+                    confidence_level = ?
                 WHERE id = ?;
-            """, (reflection_text, trade_id))
+            """, (reflection_text, key_improvement_points, confidence_level, trade_id))
             self.db_connection.commit()
             print(f"[DB] Reflection stored for trade_id={trade_id}")
         except Exception as e:
@@ -244,10 +315,11 @@ Your style: objective, concise, and offering improvements for the future.
         if not recent_trades:
             return None
 
+        print(recent_trades[0])
         trades_data = []
         for trade in recent_trades:
-            # (id, timestamp, action, trade_percent, trade_amount, reason, balance_after, reflection)
-            t_id, ts, action, t_percent, t_amount, reason, bal_after, refl = trade
+            # (id, timestamp, action, trade_percent, trade_amount, reason, balance_after, reflection, key_improvement_points, confidence_level)
+            t_id, ts, action, t_percent, t_amount, reason, bal_after, refl, kip, conf, _ = trade
             trades_data.append({
                 "id": t_id,
                 "timestamp": ts,
@@ -256,20 +328,22 @@ Your style: objective, concise, and offering improvements for the future.
                 "trade_amount": t_amount,
                 "reason": reason,
                 "balance_after": bal_after,
-                "existing_reflection": refl
+                "existing_reflection": refl,
+                "key_improvement_points": kip,
+                "confidence_level": conf
             })
 
         converted_analysis = convert_timestamps(analysis)
         reflection_prompt = f"""
 Below are recent trades and current market analysis data.
-Please provide a reflection (in Korean) on how effective the trades were, 
+Please provide a reflection on how effective the trades were, 
 what went well or poorly, and how to improve next time.
 Return a short but informative reflection in JSON format, e.g.:
 
 {{
-  "reflection": "이번 매매에서는 OOO 때문에 손실을 봤다. ... 다음엔 반드시 ...",
+  "reflection": "I lost money on this trade because of ... ... Next time I will definitely ...",
   "key_improvement_points": "...",
-  "confidence_level": "..."
+  "confidence_level": "0.8"
 }}
 
 **Recent Trades**:
@@ -296,6 +370,7 @@ Return a short but informative reflection in JSON format, e.g.:
             else:
                 reflection_json = None
 
+            print("[INFO] Reflection generated successfully.")
             return reflection_json
         except Exception as e:
             print(f"Error generating reflection: {e}")
@@ -305,29 +380,32 @@ Return a short but informative reflection in JSON format, e.g.:
     # [추가] 트레이딩 의사결정 전에 "최신 reflection"을 system message에 반영하는 메서드
     def update_trading_model_prompt(self):
         """
-        DB에서 최신 Reflection들을 불러와,
-        self.model_trading 의 system_instruction를 재설정(갱신).
+        DB에서 최신 Reflection/Key Improvement/Confidence들을 불러와
+        self.model_trading.system_instruction에 반영
         """
-        # 1) 최근 Reflection 5개 불러오기
+        # 1) 최근 Reflection 관련 정보 5개 불러오기
         reflections_texts = self.load_all_reflections(limit=5)
-        joined_reflections = "\n\n".join(reflections_texts) if reflections_texts else ""
+        # -> ["Reflection: ...\nKey Improvement Points: ...\nConfidence Level: ...", ...]
 
-        # 2) 새로운 system message 구성
+        # 2) 여러 개를 합쳐서 큰 문자열로 만들기
+        joined_reflections = "\n\n".join(reflections_texts) if reflections_texts else "No recent reflections."
+
+        # 3) 새 system message 구성
         new_system_msg = f"""
-You are an expert in Bitcoin trading, specializing in '워뇨띠'님의 매매법.
-You consider price trends, volume patterns, order book imbalances,
-market volatility, the Fear & Greed Index, relevant news, and the video transcript.
+    You are an expert in Bitcoin trading, specializing in '워뇨띠'님의 매매법.
+    You consider price trends, volume patterns, order book imbalances,
+    market volatility, the Fear & Greed Index, relevant news, and the video transcript.
 
-Here is a transcript from the 워뇨띠's trading method video:
-{self.youtube_text}
+    Here is a transcript from the 워뇨띠's trading method video:
+    {self.youtube_text}
 
-Here are previous trade reflections (updated):
-{joined_reflections}
+    Here are previous trade reflections, key improvements, and confidence levels:
+    {joined_reflections}
 
-Your job: Provide a buy/sell/hold decision & rationale.
+    Your job: Provide a buy/sell/hold decision & rationale.
         """.strip()
 
-        # 3) 트레이딩 모델의 system_instruction 갱신
+        # 4) 트레이딩 모델의 system_instruction 갱신
         self.model_trading.system_instruction = new_system_msg
         print("[INFO] Trading model system message updated with latest reflections.")
 
@@ -371,6 +449,11 @@ Your job: Provide a buy/sell/hold decision & rationale.
             profit_loss = (current_price - avg_buy_price) * btc_balance if btc_balance > 0 else 0
             profit_loss_percentage = (profit_loss / total_value * 100) if total_value > 0 else 0
 
+            print(f"[INFO] Investment status: KRW={krw_balance}, BTC={btc_balance}, "
+                  f"avg_buy_price={avg_buy_price}, current_price={current_price}, "
+                  f"total_value={total_value}, profit_loss={profit_loss}, "
+                  f"profit_loss_percentage={profit_loss_percentage:.2f}%")
+            
             return {
                 "krw_balance": krw_balance,
                 "btc_balance": btc_balance,
@@ -390,6 +473,7 @@ Your job: Provide a buy/sell/hold decision & rationale.
             orderbook = pyupbit.get_orderbook(self.ticker)
             daily_ohlcv = pyupbit.get_ohlcv(self.ticker, interval="day", count=200)
             hourly_ohlcv = pyupbit.get_ohlcv(self.ticker, interval="minute60", count=48)
+            print("[INFO] Market data fetched successfully.")
             return {
                 "orderbook": orderbook,
                 "daily_ohlcv": daily_ohlcv,
@@ -511,6 +595,7 @@ Your job: Provide a buy/sell/hold decision & rationale.
         if not analysis:
             return None
 
+        print("[INFO] Market data analysis completed.")
         return analysis
 
     def get_btc_news(self, query="BTC", gl="us", hl="en"):
@@ -539,6 +624,8 @@ Your job: Provide a buy/sell/hold decision & rationale.
                     "title": article.get("title"),
                     "date": article.get("date")
                 })
+            
+            print(f"[INFO] Fetched {len(filtered_news_results)} news articles from SerpApi.")
             return filtered_news_results
 
         except Exception as e:
@@ -588,6 +675,7 @@ Only return your answer in valid JSON format, for example:
             if json_start != -1 and json_end != -1:
                 clean_text = clean_text[json_start:json_end + 1]
                 decision_json = json.loads(clean_text)
+                print("[INFO] AI decision generated successfully.")
                 return decision_json
             else:
                 return None
@@ -629,7 +717,7 @@ Only return your answer in valid JSON format, for example:
                             balance_after=krw_balance - trade_amount
                         )
                         # 실제 주문 예시:
-                        # self.upbit.buy_market_order(self.ticker, trade_amount)
+                        self.upbit.buy_market_order(self.ticker, trade_amount)
                     else:
                         print("매수 가능한 금액이 부족하여 매수 생략")
 
@@ -649,7 +737,7 @@ Only return your answer in valid JSON format, for example:
                             balance_after=investment_status["krw_balance"] + trade_amount
                         )
                         # 실제 주문 예시:
-                        # self.upbit.sell_market_order(self.ticker, sell_amount_btc)
+                        self.upbit.sell_market_order(self.ticker, sell_amount_btc)
                     else:
                         print("매도 가능한 수량이 부족하여 매도 생략")
 
@@ -709,15 +797,15 @@ Only return your answer in valid JSON format, for example:
                     print("No valid AI decision.")
 
                 # 8) 매매 후 → 반성문 생성
-                self.db_cursor.execute("SELECT * FROM trade_records ORDER BY timestamp DESC LIMIT 3")
+                self.db_cursor.execute("SELECT * FROM trade_records WHERE coin_ticker = ? ORDER BY timestamp DESC LIMIT 1", (self.ticker,))
                 recent_trades = self.db_cursor.fetchall()
                 reflection_json = self.reflect_on_trades_and_market(recent_trades, analysis)
                 if reflection_json and "reflection" in reflection_json:
                     latest_trade_id = recent_trades[0][0]  # 가장 최근 매매 id
-                    self.store_reflection_for_trade(latest_trade_id, reflection_json["reflection"])
+                    self.store_reflection_for_trade(latest_trade_id, reflection_json)
 
                 print("\nWaiting for next trading cycle...")
-                time.sleep(60 * 60)  # 1시간마다 실행
+                time.sleep(60 * 60 * 6)  # 6시간마다 실행
 
             except Exception as e:
                 print(f"Error in main loop: {e}")
